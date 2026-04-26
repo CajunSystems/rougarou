@@ -11,6 +11,8 @@ import com.cajunsystems.rougarou.agent.worker.ToolWorkerConfig;
 import com.cajunsystems.rougarou.core.RougarouLog;
 import com.cajunsystems.rougarou.gateway.controller.GatewayController;
 import com.cajunsystems.rougarou.gateway.memory.AgentMemory;
+import com.cajunsystems.rougarou.gateway.scheduler.ScheduleWorker;
+import com.cajunsystems.rougarou.gateway.scheduler.Scheduler;
 import com.cajunsystems.rougarou.gateway.session.SessionConfig;
 import com.cajunsystems.rougarou.gateway.session.SessionManager;
 
@@ -36,6 +38,8 @@ public final class RougarouClient implements AutoCloseable {
     private final GatewayController controller;
     private final List<AgentWorker> agentWorkers;
     private final List<ToolWorker> toolWorkers;
+    private final Scheduler scheduler;
+    private final ScheduleWorker scheduleWorker;
 
     private RougarouClient(Builder b) {
         this.sharedLog = b.sharedLog;
@@ -47,8 +51,11 @@ public final class RougarouClient implements AutoCloseable {
         this.controller = new GatewayController(sessionManager, log);
         this.agentWorkers = new ArrayList<>(b.agentWorkers);
         this.toolWorkers = new ArrayList<>(b.toolWorkers);
+        this.scheduler = new Scheduler(log);
+        this.scheduleWorker = b.runScheduleWorker ? new ScheduleWorker(log) : null;
         for (var w : agentWorkers) w.start();
         for (var w : toolWorkers) w.start();
+        if (scheduleWorker != null) scheduleWorker.start();
     }
 
     public GatewayController gateway() { return controller; }
@@ -71,10 +78,14 @@ public final class RougarouClient implements AutoCloseable {
         return controller.close(sessionId, reason);
     }
 
+    /** API for requesting future deliveries. Always available; needs an enabled worker to fire. */
+    public Scheduler scheduler() { return scheduler; }
+
     @Override
     public void close() {
         for (var w : agentWorkers) w.close();
         for (var w : toolWorkers) w.close();
+        if (scheduleWorker != null) scheduleWorker.close();
         sessionManager.close();
         if (ownsBayouSystem) bayouSystem.close();
         if (ownsSharedLog) {
@@ -101,11 +112,18 @@ public final class RougarouClient implements AutoCloseable {
         private SharedLog sharedLog;
         private boolean ownsSharedLog;
         private BayouSystem bayouSystem;
+        private boolean runScheduleWorker;
         private final List<AgentWorker> agentWorkers = new ArrayList<>();
         private final List<ToolWorker> toolWorkers = new ArrayList<>();
 
         /** Reuse an existing bayou system instead of letting the client create its own. */
         public Builder bayouSystem(BayouSystem v) { this.bayouSystem = v; return this; }
+
+        /**
+         * Run a {@link ScheduleWorker} in this process. At least one process backed by the same
+         * shared log must do this for {@link Scheduler} requests to actually fire.
+         */
+        public Builder runScheduleWorker() { this.runScheduleWorker = true; return this; }
 
         /** Add an in-process agent worker; multiple may be added for parallel inference. */
         public Builder addAgentWorker(AgentWorkerConfig config) {

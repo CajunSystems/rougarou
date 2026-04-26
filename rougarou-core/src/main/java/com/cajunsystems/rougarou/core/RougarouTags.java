@@ -22,6 +22,7 @@ public final class RougarouTags {
     public static final String SESSIONS_NS = "rougarou.sessions";
     public static final String INFERENCE_NS = "rougarou.inference";
     public static final String TOOL_NS = "rougarou.tool";
+    public static final String SCHEDULE_NS = "rougarou.schedule";
     public static final String AUDIT_NS = "rougarou.audit";
 
     private RougarouTags() {}
@@ -40,6 +41,10 @@ public final class RougarouTags {
 
     public static LogTag toolTasks() {
         return LogTag.of(TOOL_NS);
+    }
+
+    public static LogTag schedule() {
+        return LogTag.of(SCHEDULE_NS);
     }
 
     public static LogTag audit() {

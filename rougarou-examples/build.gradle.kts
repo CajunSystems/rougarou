@@ -13,5 +13,8 @@ dependencies {
 }
 
 application {
-    mainClass.set("com.cajunsystems.rougarou.examples.EchoChatExample")
+    mainClass.set(
+        (project.findProperty("mainClass") as String?)
+            ?: "com.cajunsystems.rougarou.examples.EchoChatExample"
+    )
 }

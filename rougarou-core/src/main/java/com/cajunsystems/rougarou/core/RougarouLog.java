@@ -8,6 +8,9 @@ import com.cajunsystems.gumbo.core.LogPosition;
 import com.cajunsystems.gumbo.core.LogTag;
 import com.cajunsystems.rougarou.core.events.InferenceRequested;
 import com.cajunsystems.rougarou.core.events.RougarouEvent;
+import com.cajunsystems.rougarou.core.events.ScheduleCancelled;
+import com.cajunsystems.rougarou.core.events.ScheduleFired;
+import com.cajunsystems.rougarou.core.events.ScheduleRequested;
 import com.cajunsystems.rougarou.core.events.SessionClosed;
 import com.cajunsystems.rougarou.core.events.SessionCreated;
 import com.cajunsystems.rougarou.core.events.ToolRequested;
@@ -69,6 +72,11 @@ public final class RougarouLog {
         }
         if (event instanceof ToolRequested) {
             tags.add(RougarouTags.toolTasks());
+        }
+        if (event instanceof ScheduleRequested
+                || event instanceof ScheduleCancelled
+                || event instanceof ScheduleFired) {
+            tags.add(RougarouTags.schedule());
         }
 
         byte[] bytes = serializer.serialize(event);

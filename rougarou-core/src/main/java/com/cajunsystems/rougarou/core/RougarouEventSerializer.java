@@ -7,6 +7,10 @@ import com.cajunsystems.rougarou.core.events.InferenceCompleted;
 import com.cajunsystems.rougarou.core.events.InferenceFailed;
 import com.cajunsystems.rougarou.core.events.InferenceRequested;
 import com.cajunsystems.rougarou.core.events.RougarouEvent;
+import com.cajunsystems.rougarou.core.events.ScheduleCancelled;
+import com.cajunsystems.rougarou.core.events.ScheduleFired;
+import com.cajunsystems.rougarou.core.events.ScheduleKind;
+import com.cajunsystems.rougarou.core.events.ScheduleRequested;
 import com.cajunsystems.rougarou.core.events.SessionClosed;
 import com.cajunsystems.rougarou.core.events.SessionCreated;
 import com.cajunsystems.rougarou.core.events.ToolCompleted;
@@ -50,6 +54,10 @@ public final class RougarouEventSerializer implements LogSerializer<RougarouEven
                 kryo.register(ToolCompleted.class, 110);
                 kryo.register(ToolFailed.class, 111);
                 kryo.register(AgentError.class, 112);
+                kryo.register(ScheduleKind.class, 113);
+                kryo.register(ScheduleRequested.class, 114);
+                kryo.register(ScheduleCancelled.class, 115);
+                kryo.register(ScheduleFired.class, 116);
                 return kryo;
             }
         };

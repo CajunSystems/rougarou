@@ -33,6 +33,7 @@ Rougarou splits cleanly into three layers, each backed by a small set of log tag
  │   • SessionActor     – serializes per-session decisions     │
  │   • AgentMemory      – read-only projection from the log    │
  │   • GatewayController – fluent façade for the client layer  │
+ │   • Scheduler / ScheduleWorker – future-dated user turns    │
  └─────────────────────────────────────────────────────────────┘
                              │
                              ▼
@@ -47,7 +48,8 @@ Rougarou splits cleanly into three layers, each backed by a small set of log tag
  ┌─────────────────────────────────────────────────────────────┐
  │ rougarou-core  +  gumbo (shared log)                        │
  │   tags: rougarou.session:<id>, rougarou.sessions,           │
- │         rougarou.inference, rougarou.tool, rougarou.audit   │
+ │         rougarou.inference, rougarou.tool,                  │
+ │         rougarou.schedule, rougarou.audit                   │
  └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,9 +98,9 @@ tag — kill it, respawn it, and `preStart` replays the tag back into in-memory 
 | ------------------ | ----------------------------------------------------------- |
 | `rougarou-core`    | Sealed `RougarouEvent` hierarchy, log tags, Kryo serializer, `RougarouLog` facade |
 | `rougarou-agent`   | `LlmClient`, `Tool`, `Skill`, `AgentWorker`, `ToolWorker`     |
-| `rougarou-gateway` | `SessionManager`, `SessionActor`, `AgentMemory`, `GatewayController` |
+| `rougarou-gateway` | `SessionManager`, `SessionActor`, `AgentMemory`, `GatewayController`, `Scheduler`, `ScheduleWorker` |
 | `rougarou-client`  | `RougarouClient` SDK, `RougarouHttpServer`                    |
-| `rougarou-examples`| `EchoChatExample`, `HttpExample`, sample skill              |
+| `rougarou-examples`| `EchoChatExample`, `HttpExample`, `ScheduledChatExample`, sample skill |
 
 ---
 
@@ -337,6 +339,77 @@ and tool tasks via gumbo's totally-ordered subscription.
 
 ---
 
+## Scheduling future deliveries
+
+Rougarou ships a small **gumbo-native scheduler** for one-shot delayed deliveries — useful for
+idle-session pings, "remind me in 10 minutes" style follow-ups, or any case where you want a
+synthetic user turn to land at a future time.
+
+The scheduler is just three events on a dedicated `rougarou.schedule` tag:
+
+| Event              | Producer            | Effect                                       |
+| ------------------ | ------------------- | -------------------------------------------- |
+| `ScheduleRequested`| `Scheduler` API     | enqueues a future fire (`fireAt`, `payload`) |
+| `ScheduleCancelled`| `Scheduler.cancel`  | finalizes a `scheduleId` so it never fires   |
+| `ScheduleFired`    | `ScheduleWorker`    | finalizes a `scheduleId` and delivers the payload |
+
+A `ScheduleWorker` subscribes to the schedule tag, replays it to rebuild an in-memory priority
+queue keyed by `fireAt`, and parks a virtual thread on the next due entry. When it fires it
+appends `ScheduleFired` (which lands on both the schedule tag and the target session tag) and a
+`UserMessage` carrying the payload. The session actor receives the `UserMessage` like any other
+user turn and triggers inference.
+
+### Usage
+
+```java
+try (RougarouClient client = RougarouClient.builder(sharedLog)
+        .runScheduleWorker()                 // <-- enable a worker in this process
+        .addAgentWorker(...)
+        .build()) {
+
+    String sid = client.openSession(SessionConfig.builder().agentId("a").build());
+
+    // After 10 minutes, deliver "are you still there?" as a user turn — the agent will
+    // respond into the session log just as if a real user typed it.
+    String scheduleId = client.scheduler()
+            .scheduleUserInputAfter(sid, Duration.ofMinutes(10), "are you still there?")
+            .get();
+
+    // Or at an absolute instant:
+    client.scheduler().scheduleUserInputAt(sid, Instant.parse("2026-12-25T09:00:00Z"),
+            "merry christmas");
+
+    // Cancel before it fires:
+    client.scheduler().cancel(sid, scheduleId, "user-disconnected");
+}
+```
+
+### Reliability
+
+* The schedule tag is the source of truth. Restart the worker (or run it on a new node) and it
+  rebuilds the queue from the log on startup; entries that already have a matching
+  `ScheduleFired` or `ScheduleCancelled` are skipped.
+* Multiple `ScheduleWorker` processes can run side by side. Each independently rebuilds a queue;
+  the first to write `ScheduleFired` for a given `scheduleId` wins, and peers see it on their
+  subscription and skip it. Worst-case under racing peers is one extra fire if both write before
+  observing the other — keep tools idempotent (which they should be anyway).
+* Granularity is whatever the JVM scheduler gives you — typically sub-millisecond accuracy. The
+  worker uses `Condition.awaitNanos` so a sooner-than-current-head request wakes it up immediately.
+
+### When to reach for boudin instead
+
+This scheduler is intentionally small. It's a queue of one-shot fires — no retries, no recurring
+schedules, no multi-step durable workflows. If you need any of:
+
+* recurring agent runs (cron-style)
+* scheduled work that involves multiple coordinated steps
+* exponential-backoff retries on the scheduling side itself
+
+…build them with [boudin](https://github.com/CajunSystems/boudin) workflows on top, calling
+`client.scheduler().scheduleUserInputAt(...)` from within an activity.
+
+---
+
 ## HTTP API
 
 The bundled `RougarouHttpServer` is a tiny JDK-only HTTP shell — useful for poking at the system
@@ -373,6 +446,9 @@ field details. Variants:
 | `ToolCompleted`        | tool   → log   | `session`, `audit`                              |
 | `ToolFailed`           | tool   → log   | `session`, `audit`                              |
 | `AgentError`           | any    → log   | `session`, `audit`                              |
+| `ScheduleRequested`    | client → log   | `session`, `schedule`, `audit`                  |
+| `ScheduleCancelled`    | client → log   | `schedule`, `audit`                             |
+| `ScheduleFired`        | scheduler → log| `session`, `schedule`, `audit`                  |
 
 ---
 

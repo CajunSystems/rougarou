@@ -21,7 +21,10 @@ public sealed interface RougarouEvent permits
         ToolRequested,
         ToolCompleted,
         ToolFailed,
-        AgentError {
+        AgentError,
+        ScheduleRequested,
+        ScheduleCancelled,
+        ScheduleFired {
 
     String sessionId();
 

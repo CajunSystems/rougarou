@@ -150,8 +150,11 @@ public final class SessionActor implements Actor<SessionMessage> {
 
         switch (event) {
             case UserMessage um -> {
+                // Pending mapping is set by handleUserInput for client-driven turns; absent for
+                // scheduler-driven turns (where there's no waiter). Either way, schedule inference.
                 String requestId = pendingUserToInference.remove(um.messageId());
-                if (requestId != null) scheduleInference(requestId);
+                if (requestId == null) requestId = Ids.newRequestId();
+                scheduleInference(requestId);
             }
             case InferenceCompleted ic -> onInferenceCompleted(ic);
             case ToolCompleted tc -> onToolBoundaryReached(tc.requestId());
