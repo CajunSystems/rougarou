@@ -7,11 +7,14 @@ Rougarou is a Java 21+ harness for running LLM agents — like an open-source Cl
 Every user turn, inference request, tool call, and result is appended to a single shared log,
 so any layer can crash and resume from the log without losing a session.
 
-It composes three CajunSystems libraries:
+It composes two CajunSystems libraries:
 
 - **[gumbo](https://github.com/CajunSystems/gumbo)** — the shared append-only log; source of truth.
 - **[bayou](https://github.com/CajunSystems/bayou)** — actor system on top of gumbo; one actor per session.
-- **[boudin](https://github.com/CajunSystems/boudin)** — durable workflow / scheduler primitives.
+
+A third library, **[boudin](https://github.com/CajunSystems/boudin)** (durable workflows), is a
+natural extension point — see [When to reach for boudin](#when-to-reach-for-boudin-instead) below.
+It is not a current dependency.
 
 ---
 
@@ -177,7 +180,7 @@ repositories {
 
 dependencies {
     implementation("com.cajunsystems:rougarou-client:0.1.0-SNAPSHOT")
-    // pulls in rougarou-gateway, rougarou-agent, rougarou-core, gumbo, bayou, boudin
+    // pulls in rougarou-gateway, rougarou-agent, rougarou-core, gumbo, bayou
 }
 ```
 
@@ -398,15 +401,20 @@ try (RougarouClient client = RougarouClient.builder(sharedLog)
 
 ### When to reach for boudin instead
 
-This scheduler is intentionally small. It's a queue of one-shot fires — no retries, no recurring
-schedules, no multi-step durable workflows. If you need any of:
+The native scheduler is intentionally small — a queue of one-shot fires. For anything more
+involved, [boudin](https://github.com/CajunSystems/boudin) workflows are the natural next layer:
 
-* recurring agent runs (cron-style)
-* scheduled work that involves multiple coordinated steps
-* exponential-backoff retries on the scheduling side itself
+* **recurring agent runs (cron-style)** — `Workflow.sleep(Duration.ofHours(24))` inside a loop
+* **multi-step durable plans** — each step is an activity with its own retry/timeout policy,
+  state survives process restarts
+* **long-running coordination** — multi-day reminders, subscription cancellations, anything
+  that outlives a single process
 
-…build them with [boudin](https://github.com/CajunSystems/boudin) workflows on top, calling
-`client.scheduler().scheduleUserInputAt(...)` from within an activity.
+Boudin is *not* currently a rougarou dependency. The simple stateless workers used here
+(inference and tool execution) wouldn't gain anything from being workflows — wrap them only
+when you have actual orchestration to express. Add `com.cajunsystems:boudin:0.1.0` to your
+project, register a `Worker` against the same shared log, and have your activities call into
+`RougarouClient` to drive sessions.
 
 ---
 
@@ -459,8 +467,8 @@ production users will want to add:
 
 * a real `LlmClient` for their provider of choice (Anthropic, OpenAI, local)
 * a streaming response API on the SDK and HTTP server
-* boudin-backed durable timers for things like idle session timeouts and scheduled agent runs
-* metrics (Micrometer integration is straightforward through bayou and boudin)
+* boudin-backed durable workflows for cron-style recurring agents and multi-step plans
+* metrics (Micrometer integration is straightforward through bayou)
 
 PRs welcome.
 
