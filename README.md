@@ -420,8 +420,9 @@ project, register a `Worker` against the same shared log, and have your activiti
 
 ## HTTP API
 
-The bundled `RougarouHttpServer` is a tiny JDK-only HTTP shell — useful for poking at the system
-or stitching together a UI in another language. All endpoints are JSON.
+The bundled `RougarouHttpServer` is a small Javalin-on-Jetty front end (with virtual threads and
+Jackson JSON) — useful for poking at the system or stitching together a UI in another language.
+All endpoints are JSON.
 
 | Verb     | Path                                | Body / Query        | Response                    |
 | -------- | ----------------------------------- | ------------------- | --------------------------- |
@@ -430,8 +431,10 @@ or stitching together a UI in another language. All endpoints are JSON.
 | `GET`    | `/sessions/{id}/conversation`       | (none)              | `{"turns":[...]}`           |
 | `DELETE` | `/sessions/{id}`                    | (none)              | `{"closed":true}`           |
 
-Production deployments will likely want a heavier framework (auth, streaming, SSE) — replace
-`RougarouHttpServer` with your own controller wrapping `GatewayController`.
+`server.app()` exposes the underlying `Javalin` instance so callers can register additional
+routes / middleware (auth, observability, custom endpoints) without forking the file. For
+streaming responses, SSE, or websockets, build directly on the Javalin instance —
+`GatewayController.send()` returns the `CompletableFuture` you'll want to wire up.
 
 ---
 

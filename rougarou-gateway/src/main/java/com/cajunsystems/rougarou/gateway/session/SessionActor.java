@@ -10,6 +10,7 @@ import com.cajunsystems.rougarou.core.Ids;
 import com.cajunsystems.rougarou.core.RougarouLog;
 import com.cajunsystems.rougarou.core.events.AssistantMessage;
 import com.cajunsystems.rougarou.core.events.InferenceCompleted;
+import com.cajunsystems.rougarou.core.events.InferenceFailed;
 import com.cajunsystems.rougarou.core.events.InferenceRequested;
 import com.cajunsystems.rougarou.core.events.RougarouEvent;
 import com.cajunsystems.rougarou.core.events.SessionClosed;
@@ -84,10 +85,65 @@ public final class SessionActor implements Actor<SessionMessage> {
                     config.metadata(),
                     Instant.now()
             )).join();
+            return;
         }
 
-        // If on restart we'd been mid-inference, the inference task will eventually complete and
-        // be delivered back through the subscription, so we don't need to re-emit here.
+        // Crash-recovery: if we died after appending a UserMessage / ToolCompleted but before the
+        // live subscription delivered it back to schedule the follow-up inference, the session
+        // would be stuck forever — replay only mutates state, it doesn't drive scheduling. Detect
+        // those orphans by inspecting state and kick the next step ourselves.
+        recoverPendingWork(history);
+    }
+
+    /**
+     * After replay, if state shows pending work that has no in-flight follow-up event, restart
+     * the appropriate next step. Specifically:
+     * <ul>
+     *   <li>A pending inference request id with no terminal {@link InferenceCompleted} or
+     *       non-retryable {@link InferenceFailed}: re-emit {@link InferenceRequested} (idempotent
+     *       on the worker side because the request id is unchanged).</li>
+     *   <li>No pending inference, but the trailing user/tool turn never produced an
+     *       {@link InferenceRequested}: emit a fresh one with a new request id.</li>
+     * </ul>
+     */
+    private void recoverPendingWork(List<RougarouEvent> history) {
+        if (state.status() == SessionState.Status.CLOSED) return;
+
+        if (state.pendingInferenceRequestId() != null) {
+            // The original request was logged but no terminal completion event followed.
+            // Re-emit it so a worker picks it back up. (No client waiter — the original caller
+            // is gone; the response will land as an AssistantMessage on the log.)
+            scheduleInference(state.pendingInferenceRequestId());
+            return;
+        }
+
+        if (!state.pendingToolCalls().isEmpty()) {
+            // Tool workers will deliver their results through the live subscription; the
+            // ToolCompleted handler will then schedule the follow-up inference. Nothing to do.
+            return;
+        }
+
+        // No request id pending and no tool calls outstanding. Check whether the trailing
+        // domain event is one that should have triggered an inference.
+        RougarouEvent trailing = lastTriggerEvent(history);
+        if (trailing instanceof UserMessage || trailing instanceof ToolCompleted) {
+            scheduleInference(Ids.newRequestId());
+        }
+    }
+
+    private static RougarouEvent lastTriggerEvent(List<RougarouEvent> history) {
+        for (int i = history.size() - 1; i >= 0; i--) {
+            RougarouEvent ev = history.get(i);
+            if (ev instanceof UserMessage
+                    || ev instanceof ToolCompleted
+                    || ev instanceof AssistantMessage
+                    || ev instanceof InferenceRequested
+                    || ev instanceof InferenceCompleted
+                    || ev instanceof InferenceFailed) {
+                return ev;
+            }
+        }
+        return null;
     }
 
     @Override
@@ -157,9 +213,31 @@ public final class SessionActor implements Actor<SessionMessage> {
                 scheduleInference(requestId);
             }
             case InferenceCompleted ic -> onInferenceCompleted(ic);
+            case InferenceFailed inf -> {
+                // A retryable failure means another attempt will follow — keep the waiter parked.
+                // Non-retryable means we've exhausted the budget; complete the waiter with an
+                // exception so callers don't hang.
+                if (!inf.retryable()) {
+                    var waiter = waiters.remove(inf.requestId());
+                    if (waiter != null) {
+                        waiter.completeExceptionally(new InferenceTerminallyFailedException(
+                                inf.errorType(), inf.message(), inf.attempt()));
+                    }
+                }
+            }
             case ToolCompleted tc -> onToolBoundaryReached(tc.requestId());
             case ToolFailed tf -> {
-                if (!tf.retryable()) onToolBoundaryReached(tf.requestId());
+                if (!tf.retryable()) {
+                    // The tool will not complete — surface this to any caller waiting on the
+                    // owning inference request and clean up the boundary so we don't deadlock
+                    // on a never-arriving result.
+                    var waiter = waiters.remove(tf.requestId());
+                    if (waiter != null) {
+                        waiter.completeExceptionally(new ToolTerminallyFailedException(
+                                tf.toolName(), tf.errorType(), tf.message(), tf.attempt()));
+                    }
+                    onToolBoundaryReached(tf.requestId());
+                }
             }
             default -> { /* other events are observed only */ }
         }

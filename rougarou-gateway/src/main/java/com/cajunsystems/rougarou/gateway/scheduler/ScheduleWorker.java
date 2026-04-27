@@ -21,6 +21,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -56,7 +57,7 @@ public final class ScheduleWorker implements AutoCloseable {
     private final PriorityQueue<Pending> queue = new PriorityQueue<>();
     private final Set<String> finalized = new HashSet<>();
 
-    private volatile boolean running;
+    private final AtomicBoolean running = new AtomicBoolean(false);
     private SharedLog.Subscription subscription;
     private Thread loopThread;
 
@@ -66,31 +67,37 @@ public final class ScheduleWorker implements AutoCloseable {
     }
 
     public void start() {
-        if (running) return;
+        // Atomic guard so concurrent start() callers can't both launch the loop thread.
+        if (!running.compareAndSet(false, true)) return;
 
-        // Synchronously apply every existing schedule event before the firing loop comes online.
-        // This avoids a startup race where ScheduleRequested arrives ahead of the matching
-        // ScheduleFired marker (when both already exist in the log) and the loop double-fires.
-        List<LogEntry> existing = sharedLog.readAll(RougarouTags.schedule()).join();
-        long replayThrough = -1;
-        for (LogEntry entry : existing) {
-            onEvent(rougarouLog.decode(entry));
-            replayThrough = entry.seqnum();
+        try {
+            // Synchronously apply every existing schedule event before the firing loop comes online.
+            // This avoids a startup race where ScheduleRequested arrives ahead of the matching
+            // ScheduleFired marker (when both already exist in the log) and the loop double-fires.
+            List<LogEntry> existing = sharedLog.readAll(RougarouTags.schedule()).join();
+            long replayThrough = -1;
+            for (LogEntry entry : existing) {
+                onEvent(rougarouLog.decode(entry));
+                replayThrough = entry.seqnum();
+            }
+
+            subscription = sharedLog.subscribe(
+                    RougarouTags.schedule(),
+                    new LogPosition(replayThrough + 1),
+                    entry -> {
+                        try {
+                            onEvent(rougarouLog.decode(entry));
+                        } catch (Throwable t) {
+                            log.error("scheduler failed handling entry seqnum={}", entry.seqnum(), t);
+                        }
+                    });
+
+            loopThread = Thread.ofVirtual().name("rougarou-scheduler").start(this::loop);
+        } catch (RuntimeException e) {
+            // If startup blew up, release the guard so a retry can succeed.
+            running.set(false);
+            throw e;
         }
-
-        subscription = sharedLog.subscribe(
-                RougarouTags.schedule(),
-                new LogPosition(replayThrough + 1),
-                entry -> {
-                    try {
-                        onEvent(rougarouLog.decode(entry));
-                    } catch (Throwable t) {
-                        log.error("scheduler failed handling entry seqnum={}", entry.seqnum(), t);
-                    }
-                });
-
-        running = true;
-        loopThread = Thread.ofVirtual().name("rougarou-scheduler").start(this::loop);
     }
 
     private void onEvent(RougarouEvent event) {
@@ -113,14 +120,14 @@ public final class ScheduleWorker implements AutoCloseable {
     }
 
     private void loop() {
-        while (running) {
+        while (running.get()) {
             Pending due = null;
             lock.lock();
             try {
-                while (running && queue.isEmpty()) {
+                while (running.get() && queue.isEmpty()) {
                     queueChanged.await();
                 }
-                if (!running) return;
+                if (!running.get()) return;
 
                 Pending head = queue.peek();
                 long nanos = Duration.between(Instant.now(), head.fireAt()).toNanos();
@@ -168,7 +175,7 @@ public final class ScheduleWorker implements AutoCloseable {
 
     @Override
     public void close() {
-        running = false;
+        if (!running.compareAndSet(true, false)) return;
         lock.lock();
         try { queueChanged.signalAll(); } finally { lock.unlock(); }
         if (subscription != null) {

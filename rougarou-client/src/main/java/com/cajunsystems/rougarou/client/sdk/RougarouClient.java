@@ -2,8 +2,6 @@ package com.cajunsystems.rougarou.client.sdk;
 
 import com.cajunsystems.bayou.BayouSystem;
 import com.cajunsystems.gumbo.api.SharedLog;
-import com.cajunsystems.rougarou.agent.skills.SkillRegistry;
-import com.cajunsystems.rougarou.agent.tools.ToolRegistry;
 import com.cajunsystems.rougarou.agent.worker.AgentWorker;
 import com.cajunsystems.rougarou.agent.worker.AgentWorkerConfig;
 import com.cajunsystems.rougarou.agent.worker.ToolWorker;
@@ -146,8 +144,4 @@ public final class RougarouClient implements AutoCloseable {
             return new RougarouClient(this);
         }
     }
-
-    public ToolRegistry tools() { return new ToolRegistry(); }
-
-    public SkillRegistry skills() { return new SkillRegistry(); }
 }
