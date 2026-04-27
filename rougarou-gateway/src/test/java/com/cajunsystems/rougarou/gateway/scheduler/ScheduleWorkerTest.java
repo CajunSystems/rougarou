@@ -108,6 +108,58 @@ class ScheduleWorkerTest {
     }
 
     @Test
+    void racingPeerWorkersProduceAtMostOneEffectiveUserMessage() throws Exception {
+        // Simulates the multi-process race: two peer ScheduleWorkers racing to fire the same
+        // schedule both append a UserMessage. Because the messageId is derived from the
+        // scheduleId, both writes carry the same messageId and SessionState dedupes the second
+        // one — the conversation only counts the user turn once.
+        try (var log = SharedLogService.open(SharedLogConfig.builder()
+                .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {
+
+            RougarouLog rl = new RougarouLog(log);
+
+            // Pre-populate the log with the SessionCreated event so the SessionActor doesn't
+            // emit one of its own.
+            String sid = "ses-race";
+            rl.append(new com.cajunsystems.rougarou.core.events.SessionCreated(
+                    sid, "agent", "", java.util.Map.of(),
+                    java.time.Instant.now())).get();
+
+            try (ScheduleWorker w1 = new ScheduleWorker(rl);
+                 ScheduleWorker w2 = new ScheduleWorker(rl)) {
+                w1.start();
+                w2.start();
+
+                // Both workers will see the ScheduleRequested and race to fire.
+                new Scheduler(rl).scheduleUserInputAfter(sid,
+                        java.time.Duration.ofMillis(80), "race payload").get();
+
+                // Wait long enough for both workers to have processed the firing window.
+                await().atMost(3, TimeUnit.SECONDS).until(() ->
+                        rl.readSession(sid).get().stream()
+                                .anyMatch(e -> e instanceof com.cajunsystems.rougarou.core.events.UserMessage));
+                Thread.sleep(400);
+
+                List<com.cajunsystems.rougarou.core.events.UserMessage> userMessages =
+                        rl.readSession(sid).get().stream()
+                                .filter(e -> e instanceof com.cajunsystems.rougarou.core.events.UserMessage)
+                                .map(e -> (com.cajunsystems.rougarou.core.events.UserMessage) e)
+                                .toList();
+
+                // Two physical UserMessage events may exist (we don't guarantee single-write at
+                // the log level), but they MUST share the same messageId so the session actor
+                // dedupes them.
+                long distinctIds = userMessages.stream()
+                        .map(com.cajunsystems.rougarou.core.events.UserMessage::messageId)
+                        .distinct().count();
+                assertThat(distinctIds)
+                        .as("racing fires must produce a single deterministic messageId")
+                        .isEqualTo(1);
+            }
+        }
+    }
+
+    @Test
     void scheduleFiredIsRoutedToScheduleAndSessionTags() throws Exception {
         try (var log = SharedLogService.open(SharedLogConfig.builder()
                 .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {

@@ -201,11 +201,17 @@ public final class SessionActor implements Actor<SessionMessage> {
     }
 
     private void handleEvent(RougarouEvent event) {
+        // Snapshot whether this UserMessage was already in state — if so, it's a duplicate from a
+        // racing scheduler peer and we must not schedule a second inference for it.
+        boolean isDuplicateUserMessage = event instanceof UserMessage um
+                && state.hasAppliedUserMessage(um.messageId());
+
         // Apply first so state reflects this event before we make scheduling decisions.
         state.apply(event);
 
         switch (event) {
             case UserMessage um -> {
+                if (isDuplicateUserMessage) break;
                 // Pending mapping is set by handleUserInput for client-driven turns; absent for
                 // scheduler-driven turns (where there's no waiter). Either way, schedule inference.
                 String requestId = pendingUserToInference.remove(um.messageId());

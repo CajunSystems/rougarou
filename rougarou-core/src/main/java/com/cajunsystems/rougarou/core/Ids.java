@@ -23,6 +23,15 @@ public final class Ids {
         return "tc-" + shortUuid();
     }
 
+    /**
+     * Deterministic id for the synthetic UserMessage emitted when a schedule fires. Tying the
+     * messageId to the scheduleId means two scheduler workers racing to fire the same schedule
+     * produce two byte-identical UserMessage events, which the session actor then deduplicates.
+     */
+    public static String scheduledUserMessageId(String scheduleId) {
+        return "msg-fire-" + scheduleId;
+    }
+
     private static String shortUuid() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 12);
     }

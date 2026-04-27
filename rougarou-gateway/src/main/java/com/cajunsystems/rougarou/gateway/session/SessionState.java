@@ -2,6 +2,7 @@ package com.cajunsystems.rougarou.gateway.session;
 
 import com.cajunsystems.rougarou.core.events.AssistantMessage;
 import com.cajunsystems.rougarou.core.events.InferenceCompleted;
+import com.cajunsystems.rougarou.core.events.InferenceFailed;
 import com.cajunsystems.rougarou.core.events.InferenceRequested;
 import com.cajunsystems.rougarou.core.events.RougarouEvent;
 import com.cajunsystems.rougarou.core.events.SessionClosed;
@@ -11,9 +12,11 @@ import com.cajunsystems.rougarou.core.events.ToolFailed;
 import com.cajunsystems.rougarou.core.events.UserMessage;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Mutable in-memory projection of a session, derived by folding {@link RougarouEvent events}
@@ -31,6 +34,10 @@ public final class SessionState {
     private final Map<String, String> metadata = new LinkedHashMap<>();
     private final List<Turn> conversation = new ArrayList<>();
     private final Map<String, PendingToolCall> pendingToolCalls = new LinkedHashMap<>();
+    /** Ids of UserMessages already folded into {@link #conversation}, used to make {@link #apply}
+     *  idempotent. The scheduler emits a deterministic id derived from {@code scheduleId} so a
+     *  multi-process double-fire produces two identical UserMessage events; the second is dropped. */
+    private final Set<String> appliedUserMessageIds = new HashSet<>();
     private String pendingInferenceRequestId;
     private Status status = Status.OPEN;
     private String lastAssistantMessage = "";
@@ -50,6 +57,11 @@ public final class SessionState {
     public boolean hasPendingWork() { return pendingInferenceRequestId != null || !pendingToolCalls.isEmpty(); }
     public String lastAssistantMessage() { return lastAssistantMessage; }
 
+    /** True if a UserMessage with this id has already been folded into the conversation. */
+    public boolean hasAppliedUserMessage(String messageId) {
+        return appliedUserMessageIds.contains(messageId);
+    }
+
     public void apply(RougarouEvent event) {
         switch (event) {
             case SessionCreated c -> {
@@ -60,7 +72,14 @@ public final class SessionState {
                     conversation.add(new Turn("system", systemPrompt));
                 }
             }
-            case UserMessage u -> conversation.add(new Turn("user", u.content()));
+            case UserMessage u -> {
+                // Idempotent fold: if a duplicate UserMessage arrives (e.g. from racing scheduler
+                // processes that both fired the same scheduleId), skip the second one so the
+                // conversation snapshot doesn't double-count the turn.
+                if (appliedUserMessageIds.add(u.messageId())) {
+                    conversation.add(new Turn("user", u.content()));
+                }
+            }
             case AssistantMessage a -> {
                 conversation.add(new Turn("assistant", a.content()));
                 this.lastAssistantMessage = a.content();
@@ -96,8 +115,15 @@ public final class SessionState {
                             "[tool_error:" + tf.toolName() + " id=" + tf.toolCallId() + " " + tf.message() + "]"));
                 }
             }
+            case InferenceFailed f -> {
+                // A terminal failure must clear the pending request id, otherwise crash recovery
+                // will see the still-pending id and re-emit InferenceRequested forever.
+                if (!f.retryable() && f.requestId().equals(pendingInferenceRequestId)) {
+                    this.pendingInferenceRequestId = null;
+                }
+            }
             case SessionClosed ignored -> this.status = Status.CLOSED;
-            default -> { /* InferenceFailed and AgentError are observed but don't change conversation */ }
+            default -> { /* AgentError is observed but doesn't change conversation */ }
         }
     }
 }

@@ -163,10 +163,15 @@ public final class ScheduleWorker implements AutoCloseable {
                     due.sessionId(), due.scheduleId(), due.kind(), due.payload(), now, now
             )).join();
 
-            // Then deliver the actual payload according to its kind.
+            // Then deliver the actual payload according to its kind. The messageId is derived
+            // deterministically from the scheduleId so a racing peer-worker that also fires this
+            // schedule writes a byte-identical UserMessage; SessionState dedupes on messageId.
             switch (due.kind()) {
                 case USER_INPUT -> rougarouLog.append(new UserMessage(
-                        due.sessionId(), Ids.newMessageId(), due.payload(), now)).join();
+                        due.sessionId(),
+                        Ids.scheduledUserMessageId(due.scheduleId()),
+                        due.payload(),
+                        now)).join();
             }
         } catch (Exception e) {
             log.error("scheduler failed firing schedule {}", due.scheduleId(), e);
