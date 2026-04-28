@@ -25,6 +25,59 @@ class RougarouHttpServerTest {
     private final ObjectMapper json = new ObjectMapper();
 
     @Test
+    void unknownSessionRoutesReturn404WithoutMutatingTheLog() throws Exception {
+        // Read-only and lifecycle routes for an unknown session id MUST NOT silently spawn an
+        // actor (whose preStart would write a phantom SessionCreated). They return 404 instead
+        // and leave the log untouched.
+        try (var log = SharedLogService.open(SharedLogConfig.builder()
+                .persistenceAdapter(new InMemoryPersistenceAdapter()).build());
+             RougarouClient client = RougarouClient.builder(log)
+                     .addAgentWorker(AgentWorkerConfig.builder()
+                             .workerId("a").llmClient(new EchoLlmClient()).build())
+                     .build();
+             RougarouHttpServer server = new RougarouHttpServer(client,
+                     SessionConfig.builder().agentId("a").build(),
+                     /* port = */ 0)) {
+            server.start();
+            int port = server.port();
+
+            HttpClient http = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5)).build();
+            String base = "http://localhost:" + port;
+            String unknown = "ses-does-not-exist";
+
+            // Snapshot how many entries the log started with — the conversation tag should still
+            // have zero events for the unknown session after each call below.
+            assertThat(client.sessionExists(unknown).join()).isFalse();
+
+            HttpResponse<String> getConv = http.send(HttpRequest.newBuilder(
+                            URI.create(base + "/sessions/" + unknown + "/conversation"))
+                            .GET().timeout(Duration.ofSeconds(5)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(getConv.statusCode()).isEqualTo(404);
+
+            HttpResponse<String> postMsg = http.send(HttpRequest.newBuilder(
+                            URI.create(base + "/sessions/" + unknown + "/messages"))
+                            .header("content-type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"content\":\"hi\"}"))
+                            .timeout(Duration.ofSeconds(5)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(postMsg.statusCode()).isEqualTo(404);
+
+            HttpResponse<String> del = http.send(HttpRequest.newBuilder(
+                            URI.create(base + "/sessions/" + unknown))
+                            .DELETE().timeout(Duration.ofSeconds(5)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(del.statusCode()).isEqualTo(404);
+
+            // Crucially: the log has NOT been mutated for that id.
+            assertThat(client.sessionExists(unknown).join())
+                    .as("unknown-session calls must not create phantom log entries")
+                    .isFalse();
+        }
+    }
+
+    @Test
     void postsAndRetrievesAConversationOverHttp() throws Exception {
         try (var log = SharedLogService.open(SharedLogConfig.builder()
                 .persistenceAdapter(new InMemoryPersistenceAdapter()).build());

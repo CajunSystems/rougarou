@@ -24,6 +24,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Subscribes to {@code rougarou.tool} task tag and dispatches each request to a registered
  * {@link Tool}. Mirrors {@link AgentWorker} but for tool execution.
+ *
+ * <h2>Idempotency</h2>
+ * <ul>
+ *   <li><b>In-process:</b> {@link #inFlight} blocks two concurrent invocations of the same
+ *       worker from double-handling the same {@code toolCallId}.</li>
+ *   <li><b>Cross-restart:</b> before invoking the tool the worker scans the request's session
+ *       tag for a terminal {@link ToolCompleted} or non-retryable {@link ToolFailed} carrying
+ *       the same {@code toolCallId}; if found, it skips the invocation. Critical for tools with
+ *       side effects (payments, emails, file writes) — without this, a {@code saveCheckpoint}
+ *       failure causes the tool to run twice on restart.</li>
+ *   <li><b>Cross-process:</b> the same scan covers it. Two workers racing past the scan would
+ *       both invoke the tool; for that case tools should themselves be idempotent.</li>
+ * </ul>
  */
 public final class ToolWorker implements AutoCloseable {
 
@@ -70,6 +83,16 @@ public final class ToolWorker implements AutoCloseable {
     }
 
     private void handle(ToolRequested req) {
+        // Cross-restart idempotency: skip if the tool already produced a terminal completion
+        // (success or non-retryable failure) for this toolCallId on the session log. Prevents
+        // a duplicate side effect when a previous saveCheckpoint failed silently and the
+        // worker is replaying ToolRequested events.
+        if (alreadyTerminallyHandled(req)) {
+            log.info("tool worker {} skipping toolCallId={} — already has a terminal completion on session tag",
+                    config.workerId(), req.toolCallId());
+            return;
+        }
+
         Optional<Tool> maybeTool = config.toolRegistry().find(req.toolName());
         if (maybeTool.isEmpty()) {
             rougarouLog.append(new ToolFailed(
@@ -107,6 +130,27 @@ public final class ToolWorker implements AutoCloseable {
                 )).join();
                 return;
             }
+        }
+    }
+
+    /**
+     * True if the session log already contains a terminal completion or a non-retryable failure
+     * for this tool call id. Read scope is bounded by the session tag (per-session, not the
+     * full tool-task queue), so cost scales with one session's history.
+     */
+    private boolean alreadyTerminallyHandled(ToolRequested req) {
+        try {
+            return rougarouLog.readSession(req.sessionId()).join().stream().anyMatch(e ->
+                    (e instanceof ToolCompleted tc && req.toolCallId().equals(tc.toolCallId()))
+                            || (e instanceof ToolFailed tf
+                                    && req.toolCallId().equals(tf.toolCallId())
+                                    && !tf.retryable()));
+        } catch (Exception e) {
+            // If the lookup fails fall through and re-process — better to risk a duplicate than
+            // to silently drop a request because the read transiently failed.
+            log.warn("tool worker {} failed reading session tag for idempotency check (toolCallId={})",
+                    config.workerId(), req.toolCallId(), e);
+            return false;
         }
     }
 

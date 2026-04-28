@@ -94,12 +94,19 @@ public final class RougarouHttpServer implements AutoCloseable {
 
     private void registerRoutes() {
         app.post("/sessions", ctx -> {
+            // The only route that creates a session.
             String sid = client.openSession(defaultConfig);
             ctx.status(201).json(Map.of("sessionId", sid));
         });
 
         app.post("/sessions/{id}/messages", ctx -> {
             String sid = ctx.pathParam("id");
+            // 404 instead of silently creating — POST /sessions is the explicit creation route.
+            // Without this, a typo in the path would manufacture a phantom session.
+            if (!client.sessionExists(sid).join()) {
+                ctx.status(404).json(Map.of("error", "session_not_found", "sessionId", sid));
+                return;
+            }
             client.resumeSession(sid, defaultConfig);
             MessageRequest req = ctx.bodyAsClass(MessageRequest.class);
             try {
@@ -118,13 +125,23 @@ public final class RougarouHttpServer implements AutoCloseable {
 
         app.get("/sessions/{id}/conversation", ctx -> {
             String sid = ctx.pathParam("id");
-            client.resumeSession(sid, defaultConfig);
+            // Read-only must NOT mutate the log. resumeSession would spawn an actor whose
+            // preStart writes a SessionCreated for an unknown id.
+            if (!client.sessionExists(sid).join()) {
+                ctx.status(404).json(Map.of("error", "session_not_found", "sessionId", sid));
+                return;
+            }
+            // Conversation projection reads from the log directly, no need to spawn the actor.
             List<AgentMemory.Turn> turns = client.memory().conversation(sid).join();
             ctx.json(Map.of("turns", turns));
         });
 
         app.delete("/sessions/{id}", ctx -> {
             String sid = ctx.pathParam("id");
+            if (!client.sessionExists(sid).join()) {
+                ctx.status(404).json(Map.of("error", "session_not_found", "sessionId", sid));
+                return;
+            }
             client.resumeSession(sid, defaultConfig);
             client.close(sid, "http-request")
                     .orTimeout(DEFAULT_CLOSE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)

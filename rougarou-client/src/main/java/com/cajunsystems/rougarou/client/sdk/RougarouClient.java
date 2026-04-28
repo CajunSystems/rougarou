@@ -76,6 +76,15 @@ public final class RougarouClient implements AutoCloseable {
         return controller.close(sessionId, reason);
     }
 
+    /**
+     * Returns true if at least one event exists on the session log tag. Cheap log read; does NOT
+     * spawn a session actor. Use this to gate "lookup-only" operations (e.g. an HTTP GET) so
+     * they don't accidentally create a phantom session as a side effect of resuming.
+     */
+    public CompletableFuture<Boolean> sessionExists(String sessionId) {
+        return log.readSession(sessionId).thenApply(events -> !events.isEmpty());
+    }
+
     /** API for requesting future deliveries. Always available; needs an enabled worker to fire. */
     public Scheduler scheduler() { return scheduler; }
 
