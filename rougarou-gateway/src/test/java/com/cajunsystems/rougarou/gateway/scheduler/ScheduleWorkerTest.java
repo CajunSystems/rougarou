@@ -160,6 +160,42 @@ class ScheduleWorkerTest {
     }
 
     @Test
+    void userMessageIsAppendedBeforeScheduleFired() throws Exception {
+        // Crash-safety guarantee: UserMessage must precede ScheduleFired in the log so that a
+        // crash between the two writes leaves the schedule un-finalized — the next worker retry
+        // re-fires and the deterministic-id dedupe absorbs the redundant write. If the order
+        // were reversed, a crash after the first write would silently drop the user turn.
+        try (var log = SharedLogService.open(SharedLogConfig.builder()
+                .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {
+
+            RougarouLog rl = new RougarouLog(log);
+            String sid = "ses-order";
+
+            try (ScheduleWorker worker = new ScheduleWorker(rl)) {
+                worker.start();
+                new Scheduler(rl).scheduleUserInputAfter(sid, Duration.ofMillis(50), "ping").get();
+
+                await().atMost(2, TimeUnit.SECONDS).until(() ->
+                        rl.readSession(sid).join().stream().anyMatch(e -> e instanceof ScheduleFired));
+
+                List<RougarouEvent> sessionEvents = rl.readSession(sid).join();
+                int userMessageIdx = -1, scheduleFiredIdx = -1;
+                for (int i = 0; i < sessionEvents.size(); i++) {
+                    if (sessionEvents.get(i) instanceof com.cajunsystems.rougarou.core.events.UserMessage
+                            && userMessageIdx < 0) userMessageIdx = i;
+                    if (sessionEvents.get(i) instanceof ScheduleFired
+                            && scheduleFiredIdx < 0) scheduleFiredIdx = i;
+                }
+                assertThat(userMessageIdx).as("UserMessage missing from session").isGreaterThanOrEqualTo(0);
+                assertThat(scheduleFiredIdx).as("ScheduleFired missing from session").isGreaterThanOrEqualTo(0);
+                assertThat(userMessageIdx)
+                        .as("UserMessage must be written before ScheduleFired so a crash between them is recoverable")
+                        .isLessThan(scheduleFiredIdx);
+            }
+        }
+    }
+
+    @Test
     void scheduleFiredIsRoutedToScheduleAndSessionTags() throws Exception {
         try (var log = SharedLogService.open(SharedLogConfig.builder()
                 .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {

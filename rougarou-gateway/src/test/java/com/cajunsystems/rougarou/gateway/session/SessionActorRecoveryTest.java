@@ -131,6 +131,58 @@ class SessionActorRecoveryTest {
     }
 
     @Test
+    void duplicateInferenceCompletedProducesOnlyOneAssistantMessage() throws Exception {
+        // Defense-in-depth: AgentWorker tries hard not to duplicate InferenceCompleted, but if
+        // a duplicate slips past (e.g. two workers race past the cross-tag check), the session
+        // actor must still produce only one AssistantMessage so the conversation isn't doubled.
+        try (var sharedLog = SharedLogService.open(SharedLogConfig.builder()
+                .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {
+
+            RougarouLog rl = new RougarouLog(sharedLog);
+            String sid = "ses-dupe-completion";
+            String requestId = "req-dupe-completion";
+
+            // Seed: SessionCreated, UserMessage, InferenceRequested.
+            rl.append(new com.cajunsystems.rougarou.core.events.SessionCreated(
+                    sid, "agent", "", java.util.Map.of(), Instant.now())).get();
+            rl.append(new UserMessage(sid, "msg-1", "hi", Instant.now())).get();
+            rl.append(new InferenceRequested(sid, requestId, "agent",
+                    java.util.List.of(new InferenceRequested.Turn("user", "hi")),
+                    java.util.List.of(), java.util.Map.of(), Instant.now())).get();
+
+            try (BayouSystem bayou = new BayouSystem(sharedLog)) {
+                SessionConfig config = SessionConfig.builder().agentId("agent").build();
+                bayou.spawn("rougarou-session-" + sid, new SessionActor(sid, config, rl));
+
+                // Wait for preStart to finish before appending — recoverPendingWork re-emits the
+                // pending InferenceRequested, so seeing the count hit 2 means the actor is past
+                // preStart and the live subscription is set up.
+                await().atMost(3, TimeUnit.SECONDS).until(() ->
+                        rl.readSession(sid).get().stream()
+                                .filter(e -> e instanceof InferenceRequested).count() == 2);
+
+                // Two completions for the same request id — simulates a duplicate invocation.
+                rl.append(new InferenceCompleted(sid, requestId, "first reply",
+                        java.util.List.of(), Instant.now())).get();
+                rl.append(new InferenceCompleted(sid, requestId, "duplicate reply",
+                        java.util.List.of(), Instant.now())).get();
+
+                await().atMost(3, TimeUnit.SECONDS).until(() ->
+                        rl.readSession(sid).get().stream()
+                                .anyMatch(e -> e instanceof com.cajunsystems.rougarou.core.events.AssistantMessage));
+                Thread.sleep(400); // stability window to confirm a second AssistantMessage doesn't follow
+
+                long assistantCount = rl.readSession(sid).get().stream()
+                        .filter(e -> e instanceof com.cajunsystems.rougarou.core.events.AssistantMessage)
+                        .count();
+                assertThat(assistantCount)
+                        .as("a duplicate InferenceCompleted must produce only one AssistantMessage")
+                        .isEqualTo(1);
+            }
+        }
+    }
+
+    @Test
     void duplicateUserMessageDoesNotScheduleASecondInference() throws Exception {
         // If two scheduler workers race to fire the same schedule, both write a UserMessage with
         // the same deterministic messageId. The actor must process both events but only schedule

@@ -38,6 +38,10 @@ public final class SessionState {
      *  idempotent. The scheduler emits a deterministic id derived from {@code scheduleId} so a
      *  multi-process double-fire produces two identical UserMessage events; the second is dropped. */
     private final Set<String> appliedUserMessageIds = new HashSet<>();
+    /** Request ids whose terminal {@link InferenceCompleted} has already been folded. Defends
+     *  against a duplicate completion (e.g. a worker that retried after a failed checkpoint
+     *  persist) producing a duplicate AssistantMessage. */
+    private final Set<String> completedInferenceRequestIds = new HashSet<>();
     private String pendingInferenceRequestId;
     private Status status = Status.OPEN;
     private String lastAssistantMessage = "";
@@ -60,6 +64,11 @@ public final class SessionState {
     /** True if a UserMessage with this id has already been folded into the conversation. */
     public boolean hasAppliedUserMessage(String messageId) {
         return appliedUserMessageIds.contains(messageId);
+    }
+
+    /** True if an InferenceCompleted has already been folded for this request id. */
+    public boolean hasCompletedInference(String requestId) {
+        return completedInferenceRequestIds.contains(requestId);
     }
 
     public void apply(RougarouEvent event) {
@@ -86,13 +95,12 @@ public final class SessionState {
             }
             case InferenceRequested r -> this.pendingInferenceRequestId = r.requestId();
             case InferenceCompleted c -> {
+                // Idempotent fold: a duplicate completion (e.g. from a retried worker that didn't
+                // checkpoint cleanly) shouldn't double-write tool-call turns or re-mutate state.
+                if (!completedInferenceRequestIds.add(c.requestId())) break;
+
                 if (c.requestId().equals(pendingInferenceRequestId)) {
                     this.pendingInferenceRequestId = null;
-                }
-                if (!c.hasToolCalls() && c.content() != null && !c.content().isEmpty()) {
-                    // an assistant text response was produced — but we wait for AssistantMessage event
-                    // (the gateway emits that explicitly so callers can distinguish raw inference output
-                    // from the gateway-finalized message)
                 }
                 if (c.hasToolCalls()) {
                     for (var tc : c.toolCalls()) {

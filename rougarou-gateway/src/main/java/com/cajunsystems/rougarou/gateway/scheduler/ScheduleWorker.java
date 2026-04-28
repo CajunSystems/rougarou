@@ -157,15 +157,15 @@ public final class ScheduleWorker implements AutoCloseable {
     private void fire(Pending due) {
         Instant now = Instant.now();
         try {
-            // Mark fired first. ScheduleFired lands on both schedule and session tags so any
-            // peer scheduler observes it and won't fire a duplicate.
-            rougarouLog.append(new ScheduleFired(
-                    due.sessionId(), due.scheduleId(), due.kind(), due.payload(), now, now
-            )).join();
-
-            // Then deliver the actual payload according to its kind. The messageId is derived
-            // deterministically from the scheduleId so a racing peer-worker that also fires this
-            // schedule writes a byte-identical UserMessage; SessionState dedupes on messageId.
+            // Deliver the synthetic user turn FIRST. ScheduleFired is the bookkeeping marker that
+            // tells future workers "this schedule is done"; if we wrote it before the UserMessage
+            // and then crashed, the schedule would be permanently lost (the marker would
+            // suppress retry but the user turn would never have landed).
+            //
+            // By writing UserMessage first, a crash between the two writes leaves the schedule
+            // un-finalized — the next worker retries and writes a duplicate UserMessage with the
+            // same deterministic messageId, which SessionState dedupes. Net effect: the user
+            // turn lands exactly once even across crashes.
             switch (due.kind()) {
                 case USER_INPUT -> rougarouLog.append(new UserMessage(
                         due.sessionId(),
@@ -173,6 +173,12 @@ public final class ScheduleWorker implements AutoCloseable {
                         due.payload(),
                         now)).join();
             }
+
+            // Now mark fired. Lands on schedule + session + audit tags. Peer workers see it on
+            // their subscription and add it to their finalized set, suppressing redundant fires.
+            rougarouLog.append(new ScheduleFired(
+                    due.sessionId(), due.scheduleId(), due.kind(), due.payload(), now, now
+            )).join();
         } catch (Exception e) {
             log.error("scheduler failed firing schedule {}", due.scheduleId(), e);
         }

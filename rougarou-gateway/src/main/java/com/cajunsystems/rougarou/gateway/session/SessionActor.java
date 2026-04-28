@@ -201,10 +201,12 @@ public final class SessionActor implements Actor<SessionMessage> {
     }
 
     private void handleEvent(RougarouEvent event) {
-        // Snapshot whether this UserMessage was already in state — if so, it's a duplicate from a
-        // racing scheduler peer and we must not schedule a second inference for it.
+        // Snapshot dedupe-relevant flags BEFORE applying — once apply runs the dedupe sets are
+        // updated and we'd lose the "is this a duplicate" signal.
         boolean isDuplicateUserMessage = event instanceof UserMessage um
                 && state.hasAppliedUserMessage(um.messageId());
+        boolean isDuplicateInferenceCompleted = event instanceof InferenceCompleted ic
+                && state.hasCompletedInference(ic.requestId());
 
         // Apply first so state reflects this event before we make scheduling decisions.
         state.apply(event);
@@ -218,7 +220,12 @@ public final class SessionActor implements Actor<SessionMessage> {
                 if (requestId == null) requestId = Ids.newRequestId();
                 scheduleInference(requestId);
             }
-            case InferenceCompleted ic -> onInferenceCompleted(ic);
+            case InferenceCompleted ic -> {
+                // Defense in depth: AgentWorker also checks before calling the LLM, but a
+                // duplicate that slipped through must not produce a second AssistantMessage.
+                if (isDuplicateInferenceCompleted) break;
+                onInferenceCompleted(ic);
+            }
             case InferenceFailed inf -> {
                 // A retryable failure means another attempt will follow — keep the waiter parked.
                 // Non-retryable means we've exhausted the budget; complete the waiter with an

@@ -35,10 +35,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * inference event payload (full conversation snapshot), so any number of workers can be running
  * and another can pick up work after a crash.
  *
- * <p>Idempotency: workers track in-process which {@code requestId}s are already being handled.
- * On restart, the worker scans the inference tag forward from a persisted checkpoint and skips
- * requests whose response (completed / failed-non-retryable) is already visible on the session
- * tag.
+ * <h2>Idempotency</h2>
+ * <ul>
+ *   <li><b>In-process:</b> an {@link #inFlight} set blocks two concurrent calls of the same
+ *       worker from double-handling the same {@code requestId}.</li>
+ *   <li><b>Cross-restart:</b> before invoking the LLM the worker scans the request's session
+ *       tag for a terminal completion ({@link InferenceCompleted} or non-retryable
+ *       {@link InferenceFailed}) carrying the same {@code requestId}; if found, it skips the
+ *       LLM call entirely. This prevents a duplicate paid LLM invocation when a checkpoint
+ *       failed to persist before the previous restart.</li>
+ *   <li><b>Cross-process / defense-in-depth:</b> {@code SessionState} also dedupes
+ *       {@link InferenceCompleted} by {@code requestId} so a duplicate completion that slips
+ *       past the worker-side guard still doesn't append a duplicate {@code AssistantMessage}.</li>
+ * </ul>
  */
 public final class AgentWorker implements AutoCloseable {
 
@@ -85,6 +94,17 @@ public final class AgentWorker implements AutoCloseable {
     }
 
     private void handle(InferenceRequested req) {
+        // Cross-restart idempotency: if a previous worker (this one or a peer) already wrote a
+        // terminal completion or non-retryable failure for this request id, don't re-invoke the
+        // LLM. This guards against a checkpoint that failed to persist (the in-process inFlight
+        // set is reset on restart, so without this scan the worker would re-process and produce
+        // a duplicate response — and a duplicate paid LLM call).
+        if (alreadyTerminallyHandled(req)) {
+            log.info("agent worker {} skipping requestId={} — already has a terminal completion on session tag",
+                    config.workerId(), req.requestId());
+            return;
+        }
+
         ToolRegistry tools = config.toolRegistry();
         List<LlmRequest.Turn> turns = req.conversation().stream()
                 .map(t -> new LlmRequest.Turn(t.role(), t.content()))
@@ -139,6 +159,27 @@ public final class AgentWorker implements AutoCloseable {
             }
         }
         log.error("agent worker {} exhausted retries for request {}", config.workerId(), req.requestId(), lastError);
+    }
+
+    /**
+     * True if the session log already contains a terminal completion or a non-retryable failure
+     * for this request id. Read scope is bounded by the session tag (per-session, not the full
+     * inference task queue), so cost scales with one session's history.
+     */
+    private boolean alreadyTerminallyHandled(InferenceRequested req) {
+        try {
+            return rougarouLog.readSession(req.sessionId()).join().stream().anyMatch(e ->
+                    (e instanceof InferenceCompleted ic && req.requestId().equals(ic.requestId()))
+                            || (e instanceof InferenceFailed inf
+                                    && req.requestId().equals(inf.requestId())
+                                    && !inf.retryable()));
+        } catch (Exception e) {
+            // If the lookup fails, fall through and re-process — better to risk a duplicate than
+            // to silently drop a request because the read transiently failed.
+            log.warn("agent worker {} failed reading session tag for idempotency check (requestId={})",
+                    config.workerId(), req.requestId(), e);
+            return false;
+        }
     }
 
     private void sleepBackoff(int attempt) {
