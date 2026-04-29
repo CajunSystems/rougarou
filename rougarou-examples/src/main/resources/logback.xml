@@ -1,0 +1,15 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{32} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="com.cajunsystems.rougarou" level="INFO"/>
+    <logger name="com.cajunsystems.gumbo" level="WARN"/>
+    <logger name="com.cajunsystems.bayou" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>
