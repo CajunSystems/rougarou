@@ -8,6 +8,7 @@ import com.cajunsystems.rougarou.agent.skills.SkillRegistry;
 import com.cajunsystems.rougarou.agent.tools.Tool;
 import com.cajunsystems.rougarou.core.Ids;
 import com.cajunsystems.rougarou.core.RougarouLog;
+import com.cajunsystems.rougarou.core.RougarouTags;
 import com.cajunsystems.rougarou.core.events.AssistantMessage;
 import com.cajunsystems.rougarou.core.events.InferenceCompleted;
 import com.cajunsystems.rougarou.core.events.InferenceFailed;
@@ -67,13 +68,24 @@ public final class SessionActor implements Actor<SessionMessage> {
 
     @Override
     public void preStart(BayouContext<SessionMessage> ctx) {
-        // Replay everything that's already been written for this session.
-        List<RougarouEvent> history = log.readSession(sessionId).join();
-        history.forEach(state::apply);
+        // Read history via raw log entries to capture the last sequence number. We then subscribe
+        // from exactly lastSeqnum+1, closing the read-then-subscribe gap that exists when using
+        // subscribeSessionTail: any event written between the readSession call and the tail
+        // subscribe would land in neither window and be permanently lost. ScheduleWorker uses
+        // the same pattern.
+        var rawEntries = log.sharedLog().readAll(RougarouTags.session(sessionId)).join();
+        long lastSeqnum = -1L;
+        List<RougarouEvent> history = new ArrayList<>(rawEntries.size());
+        for (var entry : rawEntries) {
+            RougarouEvent ev = log.decode(entry);
+            history.add(ev);
+            state.apply(ev);
+            lastSeqnum = entry.seqnum();
+        }
 
-        // From now on, deliver live events back into our own mailbox so they're processed serially
-        // with user input. This is the key to making the actor's logic deterministic.
-        liveSubscription = log.subscribeSessionTail(sessionId, ev ->
+        // Subscribe from the next position — events appended after the read above (including any
+        // that arrived in the gap on a previous run) are delivered here with no hole.
+        liveSubscription = log.subscribeSessionFrom(sessionId, lastSeqnum, ev ->
                 ctx.self().tell(new SessionMessage.EventArrived(ev)));
 
         // If there's no history at all this is a fresh session — emit SessionCreated.
@@ -118,8 +130,10 @@ public final class SessionActor implements Actor<SessionMessage> {
         }
 
         if (!state.pendingToolCalls().isEmpty()) {
-            // Tool workers will deliver their results through the live subscription; the
-            // ToolCompleted handler will then schedule the follow-up inference. Nothing to do.
+            // The live subscription covers position lastSeqnum+1 onward (no gap), so any
+            // ToolCompleted written after the history read — including one written in what used
+            // to be the tail-subscribe gap — will be delivered and handleEvent will call
+            // onToolBoundaryReached normally. Nothing to do here.
             return;
         }
 

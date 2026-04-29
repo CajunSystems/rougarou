@@ -106,6 +106,21 @@ public final class RougarouLog {
         return log.subscribeTail(RougarouTags.session(sessionId), e -> handler.accept(decode(e)));
     }
 
+    /**
+     * Subscribe to session events starting from the position immediately after {@code afterSeqnum}.
+     * Pass {@code -1} to start from the very beginning.
+     *
+     * <p>Use this instead of {@link #subscribeSessionTail} whenever history is read first. Tail
+     * subscribe opens a gap: any event written after the {@code readSession} call but before
+     * {@code subscribeTail} completes lands in neither window and is permanently lost. By
+     * subscribing from {@code lastReadSeqnum + 1} the two windows are contiguous with no gap.
+     */
+    public SharedLog.Subscription subscribeSessionFrom(String sessionId, long afterSeqnum,
+            Consumer<RougarouEvent> handler) {
+        LogPosition from = afterSeqnum < 0 ? LogPosition.BEGINNING : new LogPosition(afterSeqnum + 1);
+        return log.subscribe(RougarouTags.session(sessionId), from, e -> handler.accept(decode(e)));
+    }
+
     /** Subscribe to the cross-session lifecycle stream. */
     public SharedLog.Subscription subscribeSessions(Consumer<RougarouEvent> handler) {
         return log.subscribeTail(RougarouTags.sessions(), e -> handler.accept(decode(e)));

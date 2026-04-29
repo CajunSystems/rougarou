@@ -11,10 +11,13 @@ import com.cajunsystems.rougarou.core.events.InferenceFailed;
 import com.cajunsystems.rougarou.core.events.InferenceRequested;
 import com.cajunsystems.rougarou.core.events.RougarouEvent;
 import com.cajunsystems.rougarou.core.events.SessionCreated;
+import com.cajunsystems.rougarou.core.events.ToolCompleted;
+import com.cajunsystems.rougarou.core.events.ToolRequested;
 import com.cajunsystems.rougarou.core.events.UserMessage;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -251,6 +254,93 @@ class SessionActorRecoveryTest {
                 assertThat(inferenceCount)
                         .as("recoverPendingWork should not re-emit a terminally-failed inference")
                         .isEqualTo(1);
+            }
+        }
+    }
+
+    @Test
+    void toolCompletedInHistoryOnRestartSchedulesFollowUpInference() throws Exception {
+        // Regression for the read-then-subscribe gap: a ToolCompleted written after the
+        // readSession call but before subscribeTail would land in neither window and be
+        // silently lost (pending tool calls → stall). The fix subscribes from lastSeqnum+1
+        // so any event in that gap is delivered via the live subscription instead.
+        //
+        // This test seeds a complete tool round-trip — the ToolCompleted is already in the
+        // log when the actor restarts — and verifies recovery detects it and schedules the
+        // follow-up inference.
+        try (var sharedLog = SharedLogService.open(SharedLogConfig.builder()
+                .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {
+
+            RougarouLog rl = new RougarouLog(sharedLog);
+            String sid = "ses-tool-recovery";
+            String requestId = "req-tool-1";
+            String toolCallId = "tc-tool-1";
+            Instant now = Instant.now();
+
+            rl.append(new SessionCreated(sid, "agent", "", Map.of(), now)).get();
+            rl.append(new UserMessage(sid, "msg-tool", "call the tool", now)).get();
+            rl.append(new InferenceRequested(sid, requestId, "agent",
+                    List.of(new InferenceRequested.Turn("user", "call the tool")),
+                    List.of(), Map.of(), now)).get();
+            rl.append(new InferenceCompleted(sid, requestId, "",
+                    List.of(new InferenceCompleted.ToolCall(toolCallId, "mytool", "{}")),
+                    now)).get();
+            rl.append(new ToolRequested(sid, requestId, toolCallId, "mytool", "{}", now)).get();
+            // ToolCompleted already in log — simulates arriving "in the gap" on a previous run.
+            rl.append(new ToolCompleted(sid, requestId, toolCallId, "mytool", "\"ok\"", now)).get();
+
+            try (BayouSystem bayou = new BayouSystem(sharedLog)) {
+                SessionConfig config = SessionConfig.builder().agentId("agent").build();
+                bayou.spawn("rougarou-session-" + sid, new SessionActor(sid, config, rl));
+
+                await().atMost(5, TimeUnit.SECONDS).until(() ->
+                        rl.readSession(sid).get().stream()
+                                .filter(e -> e instanceof InferenceRequested ir
+                                        && !ir.requestId().equals(requestId))
+                                .findAny().isPresent());
+            }
+        }
+    }
+
+    @Test
+    void toolCompletedViaLiveSubscriptionSchedulesFollowUpInference() throws Exception {
+        // Companion to toolCompletedInHistoryOnRestartSchedulesFollowUpInference: here
+        // history ends at ToolRequested (tool still in flight). ToolCompleted arrives after
+        // the actor is fully live. The same onToolBoundaryReached path must fire and schedule
+        // the follow-up inference. This also covers a ToolCompleted that falls in the
+        // subscribe gap: subscribeSessionFrom(lastSeqnum+1) delivers it without a hole.
+        try (var sharedLog = SharedLogService.open(SharedLogConfig.builder()
+                .persistenceAdapter(new InMemoryPersistenceAdapter()).build())) {
+
+            RougarouLog rl = new RougarouLog(sharedLog);
+            String sid = "ses-tool-live";
+            String requestId = "req-tool-live-1";
+            String toolCallId = "tc-live-1";
+            Instant now = Instant.now();
+
+            rl.append(new SessionCreated(sid, "agent", "", Map.of(), now)).get();
+            rl.append(new UserMessage(sid, "msg-live", "call the tool", now)).get();
+            rl.append(new InferenceRequested(sid, requestId, "agent",
+                    List.of(new InferenceRequested.Turn("user", "call the tool")),
+                    List.of(), Map.of(), now)).get();
+            rl.append(new InferenceCompleted(sid, requestId, "",
+                    List.of(new InferenceCompleted.ToolCall(toolCallId, "mytool", "{}")),
+                    now)).get();
+            rl.append(new ToolRequested(sid, requestId, toolCallId, "mytool", "{}", now)).get();
+
+            try (BayouSystem bayou = new BayouSystem(sharedLog)) {
+                SessionConfig config = SessionConfig.builder().agentId("agent").build();
+                bayou.spawn("rougarou-session-" + sid, new SessionActor(sid, config, rl));
+
+                // ToolCompleted arrives while the actor is running.
+                rl.append(new ToolCompleted(sid, requestId, toolCallId, "mytool", "\"done\"",
+                        Instant.now())).get();
+
+                await().atMost(5, TimeUnit.SECONDS).until(() ->
+                        rl.readSession(sid).get().stream()
+                                .filter(e -> e instanceof InferenceRequested ir
+                                        && !ir.requestId().equals(requestId))
+                                .findAny().isPresent());
             }
         }
     }
